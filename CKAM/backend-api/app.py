@@ -21,21 +21,22 @@ def get_db_client():
     This function runs before EACH API request to ensure we always have a fresh
     DynamoDB client with valid, non-expired credentials.
     """
-    # The 'g' object is a special Flask context that is unique for each request.
-    # We use it to store our client for the duration of this single request.
     if 'dynamo_client' not in g:
         cross_account_role_arn = os.environ.get("CROSS_ACCOUNT_ROLE_ARN")
-        
-        if app.config.get('LOCALSTACK_ENDPOINT'):
-            # Logic for local development (unchanged)
-            g.dynamo_client = boto3.client(
-                'dynamodb',
-                region_name=app.config.get('AWS_REGION'),
-                endpoint_url=app.config.get('LOCALSTACK_ENDPOINT')
-            )
-        elif cross_account_role_arn:
-            # This logic will now run for each request, getting fresh credentials every time.
-            try:
+        localstack_endpoint = app.config.get('LOCALSTACK_ENDPOINT')
+
+        try:
+            if localstack_endpoint:
+                # 1. Use LocalStack if configured
+                print("Using LocalStack endpoint for DynamoDB client.")
+                g.dynamo_client = boto3.client(
+                    'dynamodb',
+                    region_name=app.config.get('AWS_REGION'),
+                    endpoint_url=localstack_endpoint
+                )
+            elif cross_account_role_arn:
+                # 2. Use cross-account role if configured
+                print("Assuming cross-account role for DynamoDB client.")
                 sts_client = boto3.client('sts', region_name=app.config.get('AWS_REGION'))
                 assumed_role_object = sts_client.assume_role(
                     RoleArn=cross_account_role_arn,
@@ -49,12 +50,19 @@ def get_db_client():
                     aws_secret_access_key=credentials['SecretAccessKey'],
                     aws_session_token=credentials['SessionToken'],
                 )
-                print("Successfully assumed role and created fresh DynamoDB client for API request.")
-            except Exception as e:
-                print(f"FATAL: Could not assume role during API request. Error: {e}")
-                return jsonify({"error": "Could not establish a secure connection to the database."}), 503
-        else:
-            raise ValueError("Database is not configured. Set LOCALSTACK_ENDPOINT or CROSS_ACCOUNT_ROLE_ARN.")
+                print("Successfully assumed role and created fresh DynamoDB client.")
+            else:
+                # 3. Default to environment credentials (e.g., IAM role on EC2)
+                print("Using default environment credentials for DynamoDB client.")
+                g.dynamo_client = boto3.client(
+                    'dynamodb',
+                    region_name=app.config.get('AWS_REGION')
+                )
+        except Exception as e:
+            # This is a critical failure. The API cannot function without a DB client.
+            print(f"FATAL: Could not create a DynamoDB client. Error: {e}")
+            # We return a JSON response so the request doesn't just hang or crash.
+            return jsonify({"error": "Could not establish a connection to the database."}), 503
 
 # --- 3. SLACK APP INITIALIZATION ---
 slack_app = SlackApp(
@@ -65,7 +73,9 @@ slack_handler = SlackRequestHandler(slack_app)
 
 # --- 4. REGISTER BLUEPRINTS ---
 from routes.access_requests import access_requests_bp
+from routes.admin import admin_bp
 app.register_blueprint(access_requests_bp, url_prefix='/api/access')
+app.register_blueprint(admin_bp, url_prefix='/api/admin')
 
 
 # --- 5. HELPER FUNCTION FOR SLACK ACTIONS (Thread-Safe Version) ---
@@ -76,7 +86,7 @@ def process_action(body, logger, new_status, app_config):
     """
     action_word = "Approval" if new_status == "Approved" else "Denial"
     logger.info(f"Processing {action_word} in background thread.")
-    
+
     user_id = body['user']['id']
     approver_name = body['user']['name']
     channel_id = body['channel']['id']
@@ -113,14 +123,14 @@ def process_action(body, logger, new_status, app_config):
     except Exception as e:
         logger.error(f"FATAL: Could not create clients in thread. Error: {e}")
         return
-    
+
     response = dynamo_client.get_item(
         TableName=request_table,
         Key={'requestId': {'S': request_id}},
         ProjectionExpression='requestStatus, approver'
     )
     current_status = response.get('Item', {}).get('requestStatus', {}).get('S')
-    
+
     if current_status == 'Pending':
         dynamo_client.update_item(
             TableName=request_table,
@@ -132,10 +142,10 @@ def process_action(body, logger, new_status, app_config):
                 ':approver': {'S': approver_name}
             }
         )
-        
+
         original_blocks = body['message']['blocks']
         original_blocks.pop()
-        
+
         final_text = (f":white_check_mark: Request *Approved* by <@{user_id}>" if new_status == "Approved"
                       else f":x: Request *Denied* by <@{user_id}>")
 
@@ -191,4 +201,3 @@ def health_check():
 # --- 8. RUN THE APP ---
 if __name__ == '__main__':
     app.run(debug=True, port=5000)
-
